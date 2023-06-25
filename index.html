@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+
+<html style="margin:0px; overflow: hidden; overscroll-behavior: none;">
+
+<head>
+    <meta name="viewport" 
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0">
+
+    <style type="text/css">
+        @font-face {
+            font-family: 'Arial-Rounded Bold';
+            src: url('/Arial-Rounded Bold.ttf');
+        }
+
+        canvas {
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            -khtml-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+            outline: none;
+            -webkit-tap-highlight-color: rgba(255, 255, 255, 0); /* mobile webkit */
+        }
+    </style>
+</head>
+
+<body style="margin:0px; overflow: hidden; scroll-margin: 0px; overscroll-behavior: none;">
+    <canvas id="myCanvas" width="400" height="400">
+        Canvas not supported
+    </canvas>
+    <p id="log">
+
+    </p>
+
+    <script>
+        // #region javascript canvas and events boilerplate
+        const canvas = document.getElementById("myCanvas");
+        // const logger = document.getElementById("log");
+        canvas.addEventListener("mousemove", e=>{if(e.buttons==1) onTouchMove(e.clientX, e.clientY);});
+        canvas.addEventListener("mousedown", e=>onTouchDown(e.clientX, e.clientY));
+        canvas.addEventListener("mouseup", e=>onTouchLift());
+        canvas.addEventListener("leave", e=>onTouchLift());
+
+        document.addEventListener('touchmove', function (event) {
+        if (event.touches.length>1) { event.preventDefault(); }
+        }, false);
+        canvas.addEventListener("touchstart", e=>onTouchDown(e.touches[0].clientX, e.touches[0].clientY));
+        canvas.addEventListener("touchend", e=>onTouchLift());
+
+        document.addEventListener('gesturestart', function (event) {
+        event.preventDefault(); }, false);
+
+        canvas.addEventListener("touchmove", e=>{e.preventDefault=true;onTouchMove(e.touches[0].clientX, e.touches[0].clientY)});
+        /** @type {CanvasRenderingContext2D}*/
+        const ctx = canvas.getContext('2d');
+
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        const canvasW = canvas.width;
+        const canvasH = canvas.height;
+
+        if (canvasW>canvasH) {
+            window.alert("Landscape orientation is not supported, please rotate your phone and hit refresh");
+            throw new Error();
+        }
+
+        /** @type {Number}*/
+        let startTime;
+        /** @type {Number}*/
+        let previousTime;
+
+        /** @param {Number} time*/
+        function animation(time) {
+            if (startTime == undefined)
+                startTime = time;
+
+            if (previousTime == undefined)
+                previousTime = time;
+
+            let deltaTime = time - previousTime;
+
+            previousTime = time;
+
+            if (deltaTime == 0)
+                deltaTime = 1000 / 60.0;
+
+            onFrame(time / 1000.0, deltaTime / 1000.0);
+
+            window.requestAnimationFrame(animation)
+        }
+
+        window.requestAnimationFrame(animation);
+
+        // #endregion
+
+        const TOUCH_STATUS_NONE = "None";
+        const TOUCH_STATUS_TOUCH = "Touch";
+        const TOUCH_STATUS_HELD = "Held";
+        const TOUCH_STATUS_OFF = "Off";
+        const TOUCH_STATUS_LIFT = "Lift";
+
+        class TouchArea {
+            constructor(name, l, t, r, b) {
+                this.name = name;
+                this.l = l;
+                this.t = t;
+                this.r = r;
+                this.b = b;
+                this.status = TOUCH_STATUS_NONE;
+                this.wasOff = false;
+                this.wasLifted = false;
+                this.canvasJustTouched = false;
+            }
+
+            updateStatus(isTouched) {
+                if (this.wasLifted) {
+                    // make sure status is TOUCH_STATUS_LIFT for exactly one frame
+                    this.wasLifted = false;
+                    if (this.status == TOUCH_STATUS_HELD || 
+                        this.status == TOUCH_STATUS_TOUCH) {
+                            this.status = TOUCH_STATUS_LIFT;
+                            return;
+                    }
+                    else {
+                        this.status = TOUCH_STATUS_NONE;
+                    }
+                    
+                }
+
+                if (isTouched && this.status == TOUCH_STATUS_NONE && this.canvasJustTouched) {
+                    this.status = TOUCH_STATUS_TOUCH;
+                    this.wasOff = false;
+                }
+                else if (isTouched && this.status == TOUCH_STATUS_TOUCH) 
+                    this.status = TOUCH_STATUS_HELD;
+                else if (!isTouched && this.status == TOUCH_STATUS_HELD) {
+                    this.status = TOUCH_STATUS_OFF;
+                    this.wasOff = true;
+                }
+                else if (isTouched && this.status == TOUCH_STATUS_OFF)
+                    this.status = TOUCH_STATUS_HELD;
+                else if (this.status == TOUCH_STATUS_LIFT)
+                    this.status = TOUCH_STATUS_NONE;
+
+                this.canvasJustTouched = false;
+            }
+
+            lift() {
+                this.wasLifted = true;
+            }
+
+            canvasTouched() {
+                this.canvasJustTouched = true;
+            }
+
+            isHeld(requirePersistent = false) {
+                return this.status == TOUCH_STATUS_HELD && (!requirePersistent || !wasOff);
+            }
+
+            isLifted(requirePersistent = false) {
+                return this.status == TOUCH_STATUS_LIFT && (!requirePersistent || !wasOff);
+            }
+        }
+
+        let touchAreas = [];
+
+        /** @returns {TouchArea} */
+        function getTouchArea(name) {
+            return touchAreas.find(x=>x.name == name);
+        }
+
+        let playerName = localStorage.getItem("playerName");
+        playerName = window.prompt("Enter your name", ""+playerName=="null" ? "" : playerName);
+        localStorage.setItem("playerName", playerName);
+
+
+        let levelRequestCooldown = -1;
+
+        if ("WebSocket" in window) {
+            console.log(location);
+            var socket = new WebSocket(`ws://${location.hostname}:8000/ws`);
+            
+            socket.onopen = function() {
+                console.log("WebSocket connection established.");
+                // logger.innerHTML += "WebSocket connection established." + "<br/>";
+                socket.send(`RegisterPlayer:${playerName}[levelSizeRatio=${canvasH/(canvasW-desiredResetBtnHeight)}]`);
+                levelRequestCooldown = 0;
+            };
+
+            socket.onmessage = function(event) {
+                /**@type {String} */
+                const message = event.data;
+                console.log("Received message: " + message);
+                let match = message.match("^([a-zA-Z0-9_]*):(.*)$");
+                
+                if (match) {
+                    if(match[1] == "level") {
+                        levelRequestCooldown = 0;
+                        let parts = match[2].split(";");
+                        let levelID = parseInt(parts[0]);
+                        let gridSizeX = parseInt(parts[1]);
+                        let levelString = parts[2];
+
+                        onLevelDataRecieved(levelID, gridSizeX, levelString);
+                    }
+                    else if (match[1] == "lobby") {
+                        levelRequestCooldown = 0;
+                        let parts = match[2].split("/");
+                        let playersReady = parseInt(parts[0]);
+                        let lobbySize = parseInt(parts[1]);
+
+                        onLobbyInfoRecieved(playersReady, lobbySize);
+                    }
+                    
+                }
+                // logger.innerHTML += "Received message: " + message + "<br/>";
+                
+            };
+
+            socket.onerror = function(error) {
+                console.error("WebSocket error: " + error);
+                // logger.innerHTML += "WebSocket error: " + JSON. stringify(error) + "<br/>";
+            };
+
+            socket.onclose = function(event) {
+                console.log("WebSocket connection closed with code: " + event.code);
+                // logger.innerHTML += "WebSocket connection closed with code: " + event.reason + "<br/>";
+            };
+        }
+        else
+            alert('Not supported');
+
+
+        let nextLevelID = 1;
+        let level = null;
+
+        class Level {
+            constructor(blocks, gridSizeX, gridSizeY) {
+                this.blocks = blocks;
+                this.gridSizeX = gridSizeX;
+                this.gridSizeY = gridSizeY;
+            }
+
+            getScaleFactor(canvasWidth) {
+                return canvasWidth / (this.gridSizeX * BLOCK_SIZE);
+            }
+
+            getBlock(x, y) {
+                return this.blocks[y * this.gridSizeX + x];
+            }
+
+            setBlock(x, y, value) {
+                this.blocks[y * this.gridSizeX + x] = value;
+            }
+
+            isSolid(x, y) {
+                return x < 0 || x >= this.gridSizeX || y < 0 || y >= this.gridSizeY || this.getBlock(x, y) == BLOCK_SOLID;
+            }
+        }
+
+        function requestNextLevel() {
+            socket.send(`RequestLevel:${nextLevelID}`);
+            levelRequestCooldown = 60;
+        }
+
+        function announceReady() {
+            socket.send(`AnnounceReady:`);
+        }
+
+        /** @param filledCount {Number}
+         *  @param totalCount {Number}
+        */
+        function announceProgress(filledCount, totalCount) {
+            socket.send(`AnnounceProgress:${filledCount}/${totalCount}`);
+        }
+
+        function onLevelDataRecieved(levelID, gridSizeX, data) {
+            let blocks = data.split("").map(function(item) {
+                return parseInt(item, 10);
+            });
+
+            player = new Player();
+
+            const actualBlockSize = canvasW / gridSizeX;
+            const gridSizeY = Math.floor((canvasH - desiredResetBtnHeight) / actualBlockSize);
+            const resetBtnTop = gridSizeY * actualBlockSize;
+
+            touchAreas = [
+                new TouchArea("resetButton", 0, resetBtnTop, canvasW, canvasH)
+            ];
+
+            // fill up blocks as necessary
+            if (gridSizeX*gridSizeY > blocks.length)
+                blocks = blocks.concat(Array(gridSizeX*gridSizeY - blocks.length).fill(1));
+
+            let newLevel = new Level(blocks, gridSizeX, gridSizeY);
+            newLevel.setBlock(player.x, player.y, BLOCK_COLOR);
+            level = newLevel;
+
+            gameState = GAMESTATE_PLAYING;
+
+            nextLevelID = levelID+1;
+        }
+
+        function onLobbyInfoRecieved(readyCount, lobbySize) {
+            const buttonHeight = canvasW/3;
+
+            touchAreas = [
+                new TouchArea("readyButton", canvasW/20, canvasH/2 - buttonHeight/2, 
+                                   canvasW - canvasW/20, canvasH/2 + buttonHeight/2)
+            ];
+
+            gameState = GAMESTATE_WAITING_LOBBY;
+        }
+
+
+        class Player {
+            constructor() {
+                this.x = 0.0;
+                this.y = 3.0;
+                this.speedX = 0.0;
+                this.speedY = 0.0;
+            }
+        }
+
+        let player = new Player();
+
+        const BLOCK_NONE = 0;
+        const BLOCK_SOLID = 1;
+        const BLOCK_COLOR = 2;
+
+        const GAMESTATE_WAITING = "Waiting";
+        const GAMESTATE_WAITING_LOBBY = "WaitingInLobby";
+        const GAMESTATE_PLAYING = "Playing";
+
+        let gameState = GAMESTATE_WAITING;
+
+        const BLOCK_SIZE = 20;
+
+        let desiredResetBtnHeight = canvasW/4.0;
+
+        function reset() {
+            player = new Player();
+        }
+
+        let resetBtnFillAmount = 0;
+
+        let prevClientX;
+        let prevClientY;
+
+        function onTouchDown(clientX, clientY) {
+            prevClientX = clientX;
+            prevClientY = clientY;
+
+            for (const area of touchAreas)
+                area.canvasTouched();
+        }
+
+        function onTouchLift() {
+            prevClientX = null;
+            prevClientY = null;
+
+            for (const area of touchAreas)
+                area.lift();
+        }
+        /** @param newClientX {Number}
+         *  @param newClientY {Number}
+        */
+        function onTouchMove(newClientX, newClientY) {
+            if (prevClientX == null) {
+                prevClientX = newClientX;
+                prevClientY = newClientY;
+            }
+
+            if (gameState == GAMESTATE_PLAYING) {
+                let deltaX = newClientX - prevClientX;
+                let deltaY = newClientY - prevClientY;
+
+                if ((deltaX * deltaX + deltaY * deltaY) > 2 &&
+                    player.speedX == 0 && player.speedY == 0) {
+                    if (Math.abs(deltaX) > Math.abs(deltaY))
+                        player.speedX = Math.sign(deltaX) * 60;
+                    else
+                        player.speedY = Math.sign(deltaY) * 60;
+                }
+            }
+
+            prevClientX = newClientX;
+            prevClientY = newClientY;
+        }
+
+        let frameCount = 0;
+
+        /** @param {Number} deltaTime
+            @param {Number} time*/
+        function onFrame(time, deltaTime) {
+
+            function lerp(t, a, b) {
+                return (1-t)*a + t*b;
+            }
+
+            if (socket.readyState == socket.CLOSED) {
+                ctx.fillStyle = "#000";
+                ctx.fillRect(0, 0, canvasW, canvasH);
+                let fontSize = Math.round(canvasW/8);
+                ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                ctx.fillStyle = "#fff";
+                ctx.textAlign = "center";
+                ctx.fillText("Connection Lost", canvasW/2, canvasH/2);
+                return;
+            }
+
+            {
+                let anyTouched = false;
+                for (let index = touchAreas.length - 1; index >= 0; index--) {
+                    /**@type {TouchArea} */
+                    const area = touchAreas[index];
+                    const isTouched = !anyTouched &&
+                                    area.l <= prevClientX && prevClientX <= area.r && 
+                                    area.t <= prevClientY && prevClientY <= area.b;
+                    
+                    area.updateStatus(isTouched);
+                    anyTouched |= isTouched;
+                }
+            }
+
+            // player movement
+            if (gameState == GAMESTATE_PLAYING && level != null) {
+                let deltaX = player.speedX * deltaTime;
+                let deltaY = player.speedY * deltaTime;
+                let steps = Math.ceil(Math.max(Math.abs(deltaX), Math.abs(deltaY)));
+
+                for (let i = 0; i < steps; i++) {
+                    player.x += deltaX / steps;
+                    player.y += deltaY / steps;
+
+
+                    let fieldX = player.speedX > 0 ? Math.ceil(player.x) : Math.floor(player.x);
+                    let fieldY = player.speedY > 0 ? Math.ceil(player.y) : Math.floor(player.y);
+
+                    if (level.isSolid(fieldX, fieldY)) {
+                        // resolve collision
+                        player.x = player.speedX < 0 ? Math.ceil(player.x) : Math.floor(player.x);
+                        player.y = player.speedY < 0 ? Math.ceil(player.y) : Math.floor(player.y);
+
+                        level.setBlock(player.x, player.y, BLOCK_COLOR);
+
+                        player.speedX = 0.0;
+                        player.speedY = 0.0;
+                        console.log("Stop");
+                        break;
+                    }
+
+                    level.setBlock(Math.round(player.x), Math.round(player.y), BLOCK_COLOR);
+                }
+            }
+
+            ctx.fillStyle = "#000";
+            ctx.fillRect(0, 0, canvasW, canvasH);
+            
+            //draw level and handle completion
+            if (level != null) {
+                let scaling = level.getScaleFactor(canvasW);
+
+                function rectLTRB(l, t, r, b) {
+                    l = Math.round(l * scaling);
+                    t = Math.round(t * scaling);
+                    r = Math.round(r * scaling);
+                    b = Math.round(b * scaling);
+                    ctx.fillRect(l, t, r-l, b-t);
+                }
+
+                function rect(x, y, w, h) {
+                    rectLTRB(x, y, x+w, y+h);
+                }
+
+                function ellipseLTRB(l, t, r, b) {
+                    l = Math.round(l * scaling);
+                    t = Math.round(t * scaling);
+                    r = Math.round(r * scaling);
+                    b = Math.round(b * scaling);
+                    ctx.beginPath();
+                    ctx.ellipse((l+r)/2, (t+b)/2, (r-l)/2, (b-t)/2, 0, 0, Math.PI * 2);
+                    ctx.closePath();
+                    ctx.fill();
+                }
+
+                function ellipse(x, y, w, h) {
+                    ellipseLTRB(x, y, x+w, y+h);
+                }
+
+                let emptyCount = 0;
+                let filledCount = 0;
+
+                for (let x = 0; x < level.gridSizeX; x++) {
+                    for (let y = 0; y < level.gridSizeY; y++) {
+                        switch (level.getBlock(x, y)) {
+                            case BLOCK_NONE:
+                                emptyCount++;
+                                break;
+                            case BLOCK_SOLID:
+                                if (x % 2 == y % 2)
+                                    ctx.fillStyle = "#555";
+                                else
+                                    ctx.fillStyle = "#333";
+
+                                rect(x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+                                break;
+                            case BLOCK_COLOR:
+                                filledCount++;
+
+                                ctx.fillStyle = "#f55";
+                                rect(x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+                                break;
+
+                            default:
+                                break;
+                        }
+                    }
+                }
+
+                if (frameCount%10 == 0)
+                    announceProgress(filledCount, filledCount+emptyCount);
+
+                if (emptyCount == 0) {
+                    if (levelRequestCooldown == 0) {
+                        gameState = GAMESTATE_WAITING;
+                        requestNextLevel();
+                    }
+                }
+
+                {
+                    let t = 0;
+                    let b = scaling * BLOCK_SIZE * 3;
+                    let fontSize = Math.round((b-t)*0.9);
+                    ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                    ctx.textAlign = "center";
+                    ctx.fillStyle = "#0008";
+                    rectLTRB(0, 0, level.gridSizeX*BLOCK_SIZE, 3*BLOCK_SIZE);
+                    ctx.fillStyle = "#f33";
+                    ctx.fillText(`Level ${nextLevelID-1}`, canvasW/2, (t+b)/2+fontSize/3);
+                }
+                
+
+                ctx.fillStyle = "#900";
+                ellipse(player.x * BLOCK_SIZE,
+                    player.y * BLOCK_SIZE,
+                    BLOCK_SIZE, BLOCK_SIZE);
+
+                let resetButton = getTouchArea("resetButton");
+
+                if (resetButton != null) {
+                    ctx.fillStyle = "#800"
+                    rectLTRB(0, resetButton.t / scaling, canvasW / scaling, canvasH / scaling);
+                    let resetBtnHeight = canvasH-resetButton.t;
+                    let fontSize = Math.round(resetBtnHeight*0.5);
+                    ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                    ctx.fillStyle = "#f00";
+                    ctx.textAlign = "center";
+                    ctx.fillText("RESET", canvas.clientWidth/2, (resetButton.t + canvasH)/2 + fontSize/3);
+
+                    ctx.fillStyle = "#0003"
+                    rectLTRB(0, resetButton.t/scaling, canvasW/scaling, 
+                        lerp(Math.pow(resetBtnFillAmount, 0.2), canvasH, resetButton.t) / scaling);
+
+                    if (resetButton.isHeld()) {
+                        resetBtnFillAmount += 0.5 * deltaTime;
+
+                        if (resetBtnFillAmount > 1.0) {
+                            reset();
+                            resetButton.lift();
+                        }
+                    }
+                    else {
+                        resetBtnFillAmount = 0.0;
+                    }
+                }
+            }
+            
+
+            if (gameState == GAMESTATE_WAITING) {
+                ctx.fillStyle = "#0008";
+                ctx.fillRect(0, 0, canvasW, canvasH);
+                let fontSize = Math.round(canvasW/10);
+                ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                ctx.fillStyle = "#fff";
+                ctx.textAlign = "center";
+                ctx.fillText("Loading"+".".repeat(time%4), canvasW/2, canvasH/2);
+            }
+
+            if (gameState == GAMESTATE_WAITING_LOBBY) {
+                let readyButton = getTouchArea("readyButton");
+
+                if (readyButton != null) {
+                    ctx.fillStyle = readyButton.isHeld() ? "#0f0" : "#0c0";
+
+                    let btn = readyButton;
+                    ctx.fillRect(btn.l, btn.t, btn.r-btn.l, btn.b-btn.t);
+                    ctx.strokeStyle = "#0008";
+                    ctx.lineWidth = 20;
+                    ctx.strokeRect(btn.l, btn.t, btn.r-btn.l, btn.b-btn.t);
+
+                    let fontSize = Math.round((btn.b-btn.t)/2);
+                    ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                    ctx.fillStyle = "#fff";
+                    ctx.textAlign = "center";
+                    ctx.fillText("Ready!", (btn.r-btn.l)/2, (btn.t+btn.b)/2+fontSize/3);
+
+                    if (readyButton.isLifted()) {
+                        announceReady();
+                    }
+                }
+            }
+
+            if (levelRequestCooldown > 0)
+                levelRequestCooldown--;
+
+            frameCount++;
+
+        }
+    </script>
+</body>
+
+</html>

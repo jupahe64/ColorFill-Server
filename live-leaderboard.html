@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<title>ColorFill Live-Leaderboard</title>
+<body>
+<h2>Dynamic Progress Bar with Labels</h2>
+<p>Centered label:</p>
+
+<div>
+  <div id="myBar" style="background: #f00; width:20%">20%</div>
+</div>
+<br>
+<button onclick="move()">Click Me</button>
+
+<script>
+if ("WebSocket" in window) {
+    console.log(location);
+    var socket = new WebSocket(`ws://${location.hostname}:8000/leaderboard/ws`);
+    
+    socket.onopen = function() {
+        console.log("WebSocket connection established.");
+    };
+
+    socket.onmessage = function(event) {
+        /**@type {String} */
+        const message = event.data;
+        console.log("Received message: " + message);
+        // logger.innerHTML += "Received message: " + message + "<br/>";
+        
+    };
+
+    socket.onerror = function(error) {
+        console.error("WebSocket error: " + error);
+        // logger.innerHTML += "WebSocket error: " + JSON. stringify(error) + "<br/>";
+    };
+
+    socket.onclose = function(event) {
+        console.log("WebSocket connection closed with code: " + event.code);
+        // logger.innerHTML += "WebSocket connection closed with code: " + event.reason + "<br/>";
+    };
+}
+else
+    alert('Not supported');
+
+function move() {
+  var elem = document.getElementById("myBar");
+  var width = 20;
+  var id = setInterval(frame, 10);
+  function frame() {
+    if (width >= 100) {
+      clearInterval(id);
+    } else {
+      width++;
+      elem.style.width = width + '%';
+      elem.innerHTML = width * 1  + '%';
+    }
+  }
+}
+</script>
+
+</body>
+</html>
