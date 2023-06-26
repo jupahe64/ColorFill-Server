@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os.path
 import re
+from typing import Optional
 
 import aiohttp
 from aiohttp import web, WSMessage
@@ -34,6 +35,8 @@ class PlayerInfo:
 
 
 leaderboard_listeners = []
+
+leaderboard_results_json: Optional[str] = None
 
 
 async def get_level(level_id):
@@ -151,15 +154,8 @@ async def websocket_handler(request: Request):
 
                         results.sort(key=lambda x: x[1]+x[2], reverse=True)
 
-                        results_json = json.dumps(results)
-
-                        for listener in leaderboard_listeners:
-                            listener: WebSocketResponse
-                            if listener.closed:
-                                continue
-                            await listener.send_str(results_json)
-
-                        leaderboard_listeners[:] = [x for x in leaderboard_listeners if not x.closed]
+                        global leaderboard_results_json
+                        leaderboard_results_json = json.dumps(results)
 
         elif msg.type == aiohttp.WSMsgType.ERROR:
             print('ws connection closed with exception %s' % ws.exception())
@@ -219,8 +215,23 @@ async def start_server(host="192.168.137.1", port=8000):
     await site.start()
 
 
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
+async def publish_results():
+    while True:
+        await asyncio.sleep(0.1)
 
-    loop.run_until_complete(start_server())
+        if leaderboard_results_json is not None:
+            for listener in leaderboard_listeners:
+                listener: WebSocketResponse
+                if listener.closed:
+                    continue
+                await listener.send_str(leaderboard_results_json)
+
+        leaderboard_listeners[:] = [x for x in leaderboard_listeners if not x.closed]
+
+
+if __name__ == "__main__":
+    asyncio.ensure_future(start_server())
+    asyncio.ensure_future(publish_results())
+
+    loop = asyncio.get_event_loop()
     loop.run_forever()
