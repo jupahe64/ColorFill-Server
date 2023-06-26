@@ -192,7 +192,7 @@
                 /**@type {String} */
                 const message = event.data;
                 console.log("Received message: " + message);
-                let match = message.match("^([a-zA-Z0-9_]*):(.*)$");
+                let match = message.match("^([a-zA-Z0-9_]*):([\\s\\S]*)$");
                 
                 if (match) {
                     if(match[1] == "level") {
@@ -205,12 +205,19 @@
                         onLevelDataRecieved(levelID, gridSizeX, levelString);
                     }
                     else if (match[1] == "lobby") {
-                        levelRequestCooldown = 0;
                         let parts = match[2].split("/");
                         let playersReady = parseInt(parts[0]);
                         let lobbySize = parseInt(parts[1]);
 
                         onLobbyInfoRecieved(playersReady, lobbySize);
+                    }
+                    else if (match[1] == "message") {
+                        let parts = match[2].split(";", 3);
+                        let bgFillStyle = parts[0];
+                        let fgFillStyle = parts[1];
+                        let message = parts[2];
+
+                        onMessageRecieved(message, fgFillStyle, bgFillStyle);
                     }
                     
                 }
@@ -234,6 +241,10 @@
 
         let nextLevelID = 1;
         let level = null;
+
+        let message = null;
+        let messageFgFillStyle = "#fff";
+        let messageBgFillStyle = "#000";
 
         class Level {
             constructor(blocks, gridSizeX, gridSizeY) {
@@ -314,6 +325,14 @@
             gameState = GAMESTATE_WAITING_LOBBY;
         }
 
+        function onMessageRecieved(_message, fgFillStyle, bgFillStyle) {
+            messageFgFillStyle =fgFillStyle;
+            messageBgFillStyle =bgFillStyle;
+            message = _message;
+
+            gameState = GAMESTATE_DISPLAY_MESSAGE;
+        }
+
 
         class Player {
             constructor() {
@@ -333,7 +352,8 @@
         const GAMESTATE_WAITING = "Waiting";
         const GAMESTATE_WAITING_LOBBY = "WaitingInLobby";
         const GAMESTATE_PLAYING = "Playing";
-
+        const GAMESTATE_DISPLAY_MESSAGE = "DisplayMessage";
+        
         let gameState = GAMESTATE_WAITING;
 
         const BLOCK_SIZE = 20;
@@ -407,7 +427,25 @@
                 ctx.font = `${fontSize}px Arial-Rounded Bold`;
                 ctx.fillStyle = "#fff";
                 ctx.textAlign = "center";
-                ctx.fillText("Connection Lost", canvasW/2, canvasH/2);
+                ctx.fillText("Connection Lost", canvasW/2, canvasH/2 + fontSize/3);
+                return;
+            }
+
+            if (gameState == GAMESTATE_DISPLAY_MESSAGE) {
+                ctx.fillStyle = messageBgFillStyle;
+                ctx.fillRect(0, 0, canvasW, canvasH);
+                let fontSize = Math.round(canvasW/8);
+                ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                ctx.fillStyle = messageFgFillStyle;
+                ctx.textAlign = "center";
+                let lines = message.split("\n");
+
+                let i = 0;
+                for (line of lines) {
+                    let offset = (-lines.length/2+i) * fontSize;
+                    ctx.fillText(line, canvasW/2, canvasH/2 + offset + fontSize/3);
+                    i++;
+                }
                 return;
             }
 

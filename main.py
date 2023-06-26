@@ -90,6 +90,15 @@ async def websocket_handler(request: Request):
                         if match:
                             player_name, extra_infos = match.groups()
 
+                            if all_players_ready and player_info:
+                                level_id, level_str = await get_level(max(1, player_info.level))
+                                player: PlayerInfo
+                                await ws.send_str(f"level:{level_id};{gridSizeX};{level_str}")
+                                continue
+                            elif all_players_ready and not player_info:
+                                await ws.send_str(f"message:#400;#fcc;Game already\nin progress")
+                                continue
+
                             if not player_info:
                                 player_info = PlayerInfo(player_name, ws)
                                 player_info.is_ready = all_players_ready
@@ -105,16 +114,11 @@ async def websocket_handler(request: Request):
 
                                     gridSizeY = min(gridSizeY, int(round(float(value) * gridSizeX)))
 
-                            if all_players_ready:
-                                level_id, level_str = await get_level(max(1, player_info.level))
-                                player: PlayerInfo
-                                await ws.send_str(f"level:{level_id};{gridSizeX};{level_str}")
-                            else:
-                                for key, player in list(remote_player_infos.items()):
-                                    if player.socket.closed:
-                                        del remote_player_infos[key]
-                                        continue
-                                    await player.socket.send_str(f"lobby:{ready_players_count}/{len(remote_player_infos)}")
+                            for key, player in list(remote_player_infos.items()):
+                                if player.socket.closed:
+                                    del remote_player_infos[key]
+                                    continue
+                                await player.socket.send_str(f"lobby:{ready_players_count}/{len(remote_player_infos)}")
 
                     elif command == "AnnounceReady":
                         was_all_players_ready = all_players_ready
