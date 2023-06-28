@@ -1,15 +1,13 @@
-import itertools
 import json
 import mimetypes
 import os.path
 import re
-from typing import Optional
+from typing import Optional, Callable, NamedTuple
 
 import aiohttp
 from aiohttp import web, WSMessage
 import asyncio
 
-from aiohttp.abc import BaseRequest
 from aiohttp.web_request import Request
 from aiohttp.web_ws import WebSocketResponse
 
@@ -18,20 +16,34 @@ import LevelGenerator
 generated_levels: list[str] = []
 generated_levels_lock = asyncio.Lock()
 
-gridSizeX = 30
-gridSizeY = 0xFFFFFFFF
+levels_to_win = 1
 
 remote_player_infos = {}
 
 
+class ResultMessage(NamedTuple):
+    message: str
+    bg_style: str
+    fg_style: str
+
+    def to_message(self, players_left):
+        message = self.message
+        if players_left > 0:
+            message += f"\n{players_left} players left"
+        else:
+            message += "\nGame complete"
+        return create_message_message(message, self.bg_style, self.fg_style)
+
+
 class PlayerInfo:
-    def __init__(self, name, ws):
+    def __init__(self, name: str, ws: WebSocketResponse):
         self.name = name
         self.socket = ws
         self.level_size_ratio = 1.0
         self.level = 0
         self.level_progress = 0.0
         self.is_ready = False
+        self.result_message: Optional[ResultMessage] = None
 
 
 leaderboard_listeners = []
@@ -40,16 +52,83 @@ leaderboard_results_json: Optional[str] = None
 
 
 async def get_level(level_id):
+    grid_size_x = 15 + 5 * (level_id-1)//2
+    max_effective_moves = 15 + 5 * (level_id-1)
+
     async with generated_levels_lock:  # probably not needed
         if level_id > len(generated_levels):
-            level = LevelGenerator.Generator(gridSizeX, 15).generate()
+            min_ratio = min(x.level_size_ratio for x in remote_player_infos.values())
+            grid_size_y = int(grid_size_x*min_ratio)
+
+            samples = [
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate(),
+                LevelGenerator.Generator(grid_size_x, grid_size_y, max_effective_moves).generate()
+            ]
+
+            # get level with the most effective moves
+            level = max(samples, key=lambda x: x[1])[0]
             level_str = ''.join(str(x) for x in level)
             generated_levels.append(level_str)
             level_id = len(generated_levels)
         else:
             level_str = generated_levels[level_id - 1]
 
-    return level_id, level_str
+    return level_id, level_str, grid_size_x
+
+
+async def send_to_all_players(message: str | Callable[[PlayerInfo], Optional[str]]):
+    player: PlayerInfo
+    for key, player in list(remote_player_infos.items()):
+        if player.socket.closed:
+            print("Closed connection with", player.name)
+            del remote_player_infos[key]
+            continue
+
+        if isinstance(message, str):
+            await player.socket.send_str(message)
+        else:
+            _message = message(player)
+            if _message is not None:
+                await player.socket.send_str(_message)
+
+
+def create_level_message(level_id, grid_size_x, brightness, level_str):
+    return f"level:{level_id};{grid_size_x};{brightness};{level_str}"
+
+
+def create_message_message(message, bg_style="#000", fg_style="#fff"):
+    return f"message:{bg_style};{fg_style};{message}"
+
+
+def update_leaderboard_results():
+    info: PlayerInfo
+    results = [
+        [info.name, info.level, info.level_progress]
+        for info in remote_player_infos.values()
+    ]
+
+    results.sort(key=lambda x: x[1] + x[2], reverse=True)
+
+    for entry in results:
+        if entry[1] == levels_to_win:
+            entry[1] = "F"
+
+    global leaderboard_results_json
+    leaderboard_results_json = json.dumps(results)
+
+
+def ready_players_count():
+    return sum(1 for p in remote_player_infos.values() if p.is_ready)
+
+
+def players_done_count():
+    return sum(1 for p in remote_player_infos.values() if p.result_message is not None)
 
 
 async def websocket_handler(request: Request):
@@ -70,39 +149,51 @@ async def websocket_handler(request: Request):
 
                 print("received", msg.data, "from", origin)
 
-                player_info: PlayerInfo = remote_player_infos.get(request.remote, None)
+                player_info: PlayerInfo = remote_player_infos.get(id(request), None)
 
                 p: PlayerInfo
-                ready_players_count = sum(1 for p in remote_player_infos.values() if p.is_ready)
-                all_players_ready = ready_players_count == len(remote_player_infos)
+                all_players_ready = ready_players_count() == len(remote_player_infos)
 
-                if ready_players_count == 0:
+                if ready_players_count() == 0:
                     all_players_ready = False
-
-                global gridSizeY
 
                 match = re.match("^([a-zA-Z0-9_]*):(.*)$", msg.data)
                 if match:
                     command, data = match.groups()
 
                     if command == "RegisterPlayer":
+                        if player_info is not None and player_info.result_message is not None:
+                            await ws.send_str(player_info.result_message.to_message(
+                                len(remote_player_infos) - players_done_count()
+                            ))
+                            continue
+
                         match = re.match("^(.*)\\[(.*)]$", data)
                         if match:
                             player_name, extra_infos = match.groups()
 
-                            if all_players_ready and player_info:
-                                level_id, level_str = await get_level(max(1, player_info.level))
+                            if all_players_ready and player_info is not None:
+                                level_id, level_str, grid_size_x = await get_level(max(1, player_info.level))
                                 player: PlayerInfo
-                                await ws.send_str(f"level:{level_id};{gridSizeX};{level_str}")
+                                brightness = 1.0 - (level_id - 1) / levels_to_win
+                                await ws.send_str(
+                                    create_level_message(level_id,grid_size_x,brightness,level_str)
+                                )
                                 continue
-                            elif all_players_ready and not player_info:
-                                await ws.send_str(f"message:#400;#fcc;Game already\nin progress")
+                            elif all_players_ready and player_info is None:
+                                await ws.send_str(
+                                    create_message_message(
+                                        "Game already\nin progress",
+                                        bg_style="#400", fg_style="#fcc"
+                                    )
+                                )
                                 continue
 
-                            if not player_info:
+                            if player_info is None:
                                 player_info = PlayerInfo(player_name, ws)
                                 player_info.is_ready = all_players_ready
-                                remote_player_infos[request.remote] = player_info
+                                remote_player_infos[id(request)] = player_info
+
                             elif player_info.socket.closed:
                                 player_info.socket = ws
 
@@ -112,13 +203,7 @@ async def websocket_handler(request: Request):
                                 if key == "levelSizeRatio":
                                     player_info.level_size_ratio = float(value)
 
-                                    gridSizeY = min(gridSizeY, int(round(float(value) * gridSizeX)))
-
-                            for key, player in list(remote_player_infos.items()):
-                                if player.socket.closed:
-                                    del remote_player_infos[key]
-                                    continue
-                                await player.socket.send_str(f"lobby:{ready_players_count}/{len(remote_player_infos)}")
+                            await send_to_all_players(f"lobby:{ready_players_count()}/{len(remote_player_infos)}")
 
                     elif command == "AnnounceReady":
                         was_all_players_ready = all_players_ready
@@ -126,40 +211,73 @@ async def websocket_handler(request: Request):
                         all_players_ready = all(p.is_ready for p in remote_player_infos.values())
 
                         if not was_all_players_ready and all_players_ready:
-                            level_id, level_str = await get_level(1)
+                            level_id, level_str, grid_size_x = await get_level(1)
                             player: PlayerInfo
 
-                            for key, player in list(remote_player_infos.items()):
-                                if player.socket.closed:
-                                    del remote_player_infos[key]
-                                    continue
-                                await player.socket.send_str(f"level:{level_id};{gridSizeX};{level_str}")
-                                player.level = 1
+                            brightness = 1.0 - (level_id - 1) / levels_to_win
+                            await send_to_all_players(
+                                create_level_message(level_id, grid_size_x, brightness, level_str)
+                            )
+
+                            for player in remote_player_infos.values():
+                                player.level = level_id
+                        else:
+                            await send_to_all_players(f"lobby:{ready_players_count()}/{len(remote_player_infos)}")
 
                     elif command == "RequestLevel" and player_info is not None and re.match("^\\d+$", data):
-                        level_id = int(data)
-
-                        level_id, level_str = await get_level(level_id)
-                        await ws.send_str(f"level:{level_id};{gridSizeX};{level_str}")
-
                         try:
-                            player_info.level = int(data)
-
+                            level_id = int(data)
                         except TypeError:
-                            pass
+                            continue
+
+                        level_id, level_str, grid_size_x = await get_level(level_id)
+
+                        player_info.level = level_id
+
+                        if level_id == levels_to_win+1:
+                            player_info.level -= 1
+                            player_info.level_progress = 1.0
+
+                            players_done = players_done_count()
+
+                            match players_done:
+                                case 0:
+                                    player_info.result_message = ResultMessage("You are #1!", "#631", "#fc4")
+                                case 1:
+                                    player_info.result_message = ResultMessage("You are #2", "#334", "#eef4ff")
+                                case 2:
+                                    player_info.result_message = ResultMessage("You are #3", "#521", "#fa7")
+                                case _:
+                                    player_info.result_message = ResultMessage(f"You are #{players_done + 1}",
+                                                                               "#034", "#cfd")
+
+                            players_left = len(remote_player_infos) - players_done_count()
+
+                            def message(p: PlayerInfo):
+                                if p.result_message is not None:
+                                    return p.result_message.to_message(players_left)
+                                else:
+                                    return None
+
+                            await send_to_all_players(message)
+
+                            update_leaderboard_results()
+
+                            if players_done_count() == len(remote_player_infos):
+                                remote_player_infos.clear()
+                                generated_levels.clear()
+
+                            continue
+
+                        brightness = 1.0-(level_id-1)/levels_to_win
+                        await ws.send_str(
+                            create_level_message(level_id, grid_size_x, brightness, level_str)
+                        )
+
                     elif command == "AnnounceProgress" and player_info is not None and re.match("^\\d+/\\d+$", data):
                         player_info.level_progress = eval(data)  # should be fine
 
-                        info: PlayerInfo
-                        results = [
-                            [info.name, info.level, info.level_progress]
-                            for info in remote_player_infos.values()
-                        ]
-
-                        results.sort(key=lambda x: x[1]+x[2], reverse=True)
-
-                        global leaderboard_results_json
-                        leaderboard_results_json = json.dumps(results)
+                        update_leaderboard_results()
 
         elif msg.type == aiohttp.WSMsgType.ERROR:
             print('ws connection closed with exception %s' % ws.exception())
@@ -217,6 +335,7 @@ async def start_server(host="192.168.137.1", port=8000):
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
+    print("server started on", host, f"port={port}")
 
 
 async def publish_results():
