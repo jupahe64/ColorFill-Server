@@ -172,7 +172,7 @@
         }
 
         let playerName = localStorage.getItem("playerName");
-        playerName = window.prompt("Enter your name", ""+playerName=="null" ? "" : playerName);
+        playerName = window.prompt("Enter player name", ""+playerName=="null" ? "" : playerName);
         localStorage.setItem("playerName", playerName);
 
 
@@ -220,6 +220,15 @@
 
                         onMessageRecieved(message, fgFillStyle, bgFillStyle);
                     }
+                    else if (match[1] == "overlay_message") {
+                        let parts = match[2].split(";", 4);
+                        let displayTime = parseFloat(parts[0]);
+                        let animation = parts[1];
+                        let fillStyle = parts[2];
+                        let message = parts[3];
+
+                        onOverlayMessageRecieved(message, fillStyle, displayTime, animation);
+                    }
                     
                 }
                 
@@ -239,6 +248,7 @@
 
 
         let nextLevelID = 1;
+        /** @type Level? */
         let level = null;
 
         let lobby = null;
@@ -246,6 +256,21 @@
         let message = null;
         let messageFgFillStyle = "#fff";
         let messageBgFillStyle = "#000";
+
+        class OverlayMessage {
+            constructor(message, fillStyle, displayTime = 1.0, animation = "none") {
+                this.message = message;
+                this.fillStyle = fillStyle;
+                this.displayTime = displayTime;
+                this.animation = animation;
+            }
+        }
+
+        let requestedOverlayMessage = null;
+
+        let overlayMessage = null;
+
+        let overlayMessageStartTime = -100000;
 
         class Lobby {
             constructor(lobbySize, readyCount) {
@@ -256,9 +281,13 @@
 
         class Level {
             constructor(blocks, gridSizeX, gridSizeY, brightness) {
+                /** @type Number[] */
                 this.blocks = blocks;
+                /** @type Number */
                 this.gridSizeX = gridSizeX;
+                /** @type Number */
                 this.gridSizeY = gridSizeY;
+                /** @type Number */
                 this.brightness = brightness;
             }
 
@@ -288,11 +317,26 @@
             socket.send(`AnnounceReady:`);
         }
 
-        /** @param filledCount {Number}
-         *  @param totalCount {Number}
-        */
-        function announceProgress(filledCount, totalCount) {
-            socket.send(`AnnounceProgress:${filledCount}/${totalCount}`);
+        function announceProgress() {
+            if (level!=null) {
+                let levelBytes = new Uint8Array(Math.ceil(level.blocks.length / 4) * 4);
+                levelBytes.set(level.blocks);
+                let compressedLevelBytes = new Uint8Array(levelBytes.length/4);
+
+                for(let i = 0; i<levelBytes.length; i+=4) {
+                    let byte = 0;
+                    byte |= levelBytes[i+0] << (2*0);
+                    byte |= levelBytes[i+1] << (2*1);
+                    byte |= levelBytes[i+2] << (2*2);
+                    byte |= levelBytes[i+3] << (2*3);
+                    compressedLevelBytes[i/4] = byte;
+                }
+
+                socket.send(`AnnounceProgress:${level.gridSizeX};${level.gridSizeY};${
+                    btoa(String.fromCharCode.apply(null, compressedLevelBytes))
+                }`);
+            }
+
         }
 
         function onLevelDataRecieved(levelID, gridSizeX, brightness, data) {
@@ -342,6 +386,10 @@
             message = _message;
 
             gameState = GAMESTATE_DISPLAY_MESSAGE;
+        }
+
+        function onOverlayMessageRecieved(message, fillStyle, displayTime, animation) {
+            requestedOverlayMessage = new OverlayMessage(message, fillStyle, displayTime, animation);
         }
 
 
@@ -487,6 +535,7 @@
                     ctx.fillText(line, canvasW/2, canvasH/2 + offset + fontSize/3);
                     i++;
                 }
+
                 return;
             }
 
@@ -640,16 +689,7 @@
                 ctx.fill(blocksDarker);
                 ctx.fillStyle = `hsl(0, 0%, 50%, ${Math.round(100*brightness)}%)`;
                 ctx.fill(blocksLighter);
-
-                if (frameCount%10 == 0)
-                    announceProgress(filledCount, filledCount+emptyCount);
-
-                if (emptyCount == 0) {
-                    if (levelRequestCooldown == 0) {
-                        gameState = GAMESTATE_WAITING;
-                        requestNextLevel();
-                    }
-                }
+                
 
                 {
                     let t = 0;
@@ -675,11 +715,14 @@
                     ctx.fillStyle = "#800"
                     rectLTRB(0, resetButton.t / scaling, canvasW / scaling, canvasH / scaling);
                     let resetBtnHeight = canvasH-resetButton.t;
-                    let fontSize = Math.round(resetBtnHeight*0.5);
+                    let fontSize = Math.round(resetBtnHeight*0.4);
                     ctx.font = `${fontSize}px Arial-Rounded Bold`;
+                    ctx.scale(0.9, 1.0);
+                    ctx.translate(canvasW/2*(1/0.9-1), 0);
                     ctx.fillStyle = "#f00";
                     ctx.textAlign = "center";
-                    ctx.fillText("RESET", canvas.clientWidth/2, (resetButton.t + canvasH)/2 + fontSize/3);
+                    ctx.fillText("RESET POSITION", canvasW/2, (resetButton.t + canvasH)/2 + fontSize/3);
+                    ctx.resetTransform();
 
                     ctx.fillStyle = "#0003"
                     rectLTRB(0, resetButton.t/scaling, canvasW/scaling, 
@@ -695,6 +738,18 @@
                     }
                     else {
                         resetBtnFillAmount = 0.0;
+                    }
+                }
+
+                if (gameState == GAMESTATE_PLAYING) {
+                    if (frameCount%10 == 0)
+                        announceProgress();
+
+                    if (emptyCount == 0) {
+                        if (levelRequestCooldown == 0) {
+                            gameState = GAMESTATE_WAITING;
+                            requestNextLevel();
+                        }
                     }
                 }
             }
@@ -743,6 +798,70 @@
                     }
                     
                 }
+            }
+
+            if (requestedOverlayMessage != null) {
+                overlayMessage = requestedOverlayMessage;
+                overlayMessageStartTime = time;
+                requestedOverlayMessage = null;
+            }
+
+            if (overlayMessage != null) {
+                let t = Math.min((time-overlayMessageStartTime)/overlayMessage.displayTime, 1.0);
+
+                let lines = overlayMessage.message.split("\n");
+                let fontSize = Math.round(canvasW/8);
+                ctx.font = `${fontSize}px Arial-Rounded Bold`;
+
+                let max = 0;
+                for (line of lines) {
+                    max = Math.max(
+                        max,
+                        ctx.measureText(line).width
+                    );
+                }
+                let fontScaling = (canvasW*0.8)/max;
+                fontSize = Math.round(fontSize*fontScaling);
+                ctx.font = `${fontSize}px Arial-Rounded Bold`;
+
+                ctx.globalAlpha = 1.0;
+
+                let y = canvasH/2;
+                let s = 1.0;
+
+                switch (overlayMessage.animation) {
+
+                    case "fly-in":
+                        y = -canvasH/2 + canvasH * Math.pow(t, 0.2);
+                        ctx.globalAlpha = 1.0-Math.pow(t, 10);
+                        break;
+                    case "pop-in":
+                        //todo
+
+                    case "none":
+                    default:
+                        break;
+                }
+
+                ctx.fillStyle = "#0007";
+                let top = y-fontSize*lines.length/2-20;
+                let bottom = y+fontSize*lines.length/2+20;
+                ctx.fillRect(0, top, canvasW, bottom-top);
+
+                ctx.fillStyle = overlayMessage.fillStyle;
+                
+                ctx.textAlign = "center";
+                let i = 0;
+                for (line of lines) {
+                    let offset = (-(lines.length-1)/2+i) * fontSize;
+                    ctx.fillText(line, canvasW/2, y + offset + fontSize/3);
+                    i++;
+                }
+
+                ctx.globalAlpha = 1.0;
+
+                if (t >=1.0)
+                    overlayMessage = null;
             }
 
             if (levelRequestCooldown > 0)

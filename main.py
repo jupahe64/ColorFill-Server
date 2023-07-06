@@ -1,7 +1,10 @@
+import base64
 import json
 import mimetypes
 import os.path
+import random
 import re
+import sys
 from typing import Optional, Callable, NamedTuple
 
 import aiohttp
@@ -12,48 +15,23 @@ from aiohttp.web_request import Request
 from aiohttp.web_ws import WebSocketResponse
 
 import LevelGenerator
+import numpy as np
 
 generated_levels: list[str] = []
 generated_levels_lock = asyncio.Lock()
 
-levels_to_win = 1
+levels_to_win = 8
 
 remote_player_infos = {}
 
 
-class ResultMessage(NamedTuple):
-    message: str
-    bg_style: str
-    fg_style: str
-
-    def to_message(self, players_left):
-        message = self.message
-        if players_left > 0:
-            message += f"\n{players_left} players left"
-        else:
-            message += "\nGame complete"
-        return create_message_message(message, self.bg_style, self.fg_style)
-
-
-class PlayerInfo:
-    def __init__(self, name: str, ws: WebSocketResponse):
-        self.name = name
-        self.socket = ws
-        self.level_size_ratio = 1.0
-        self.level = 0
-        self.level_progress = 0.0
-        self.is_ready = False
-        self.result_message: Optional[ResultMessage] = None
-
-
-leaderboard_listeners = []
-
-leaderboard_results_json: Optional[str] = None
-
-
 async def get_level(level_id):
     grid_size_x = 15 + 5 * (level_id-1)//2
+    # grid_size_x = 20 - (level_id - 1)*2
+    # grid_size_x = random.randint(1, 10)*5
     max_effective_moves = 15 + 5 * (level_id-1)
+    # brightness = 1.0 - (level_id - 1) / levels_to_win
+    brightness = 1.0
 
     async with generated_levels_lock:  # probably not needed
         if level_id > len(generated_levels):
@@ -79,7 +57,38 @@ async def get_level(level_id):
         else:
             level_str = generated_levels[level_id - 1]
 
-    return level_id, level_str, grid_size_x
+    return level_id, level_str, grid_size_x, brightness
+
+
+class ResultMessage(NamedTuple):
+    message: str
+    bg_style: str
+    fg_style: str
+
+    def to_message(self, players_left):
+        message = self.message
+        if players_left > 0:
+            message += f"\n{players_left} players left"
+        else:
+            message += "\nGame complete"
+        return create_message(message, self.bg_style, self.fg_style)
+
+
+class PlayerInfo:
+    def __init__(self, name: str, ws: WebSocketResponse):
+        self.name = name
+        self.socket = ws
+        self.level_size_ratio = 1.0
+        self.level = 0
+        self.level_progress = 0.0
+        self.last_progress_message = ""
+        self.is_ready = False
+        self.result_message: Optional[ResultMessage] = None
+
+
+leaderboard_listeners = []
+
+leaderboard_results_json: Optional[str] = None
 
 
 async def send_to_all_players(message: str | Callable[[PlayerInfo], Optional[str]]):
@@ -102,14 +111,31 @@ def create_level_message(level_id, grid_size_x, brightness, level_str):
     return f"level:{level_id};{grid_size_x};{brightness};{level_str}"
 
 
-def create_message_message(message, bg_style="#000", fg_style="#fff"):
+def create_message(message, bg_style="#000", fg_style="#fff"):
     return f"message:{bg_style};{fg_style};{message}"
+
+
+def create_overlay_message(message, style="#fff", display_time=1.0, animation="none"):
+    return f"overlay_message:{display_time};{animation};{style};{message}"
+
+
+async def end_game():
+    def message(p: PlayerInfo):
+        if p.result_message is not None:
+            return p.result_message.to_message(0)
+        else:
+            return None
+
+    await send_to_all_players(message)
+
+    remote_player_infos.clear()
+    generated_levels.clear()
 
 
 def update_leaderboard_results():
     info: PlayerInfo
     results = [
-        [info.name, info.level, info.level_progress]
+        [info.name, info.level, info.level_progress, info.last_progress_message]
         for info in remote_player_infos.values()
     ]
 
@@ -149,7 +175,7 @@ async def websocket_handler(request: Request):
 
                 print("received", msg.data, "from", origin)
 
-                player_info: PlayerInfo = remote_player_infos.get(id(request), None)
+                player_info: PlayerInfo = remote_player_infos.get(request.remote, None)
 
                 p: PlayerInfo
                 all_players_ready = ready_players_count() == len(remote_player_infos)
@@ -173,16 +199,15 @@ async def websocket_handler(request: Request):
                             player_name, extra_infos = match.groups()
 
                             if all_players_ready and player_info is not None:
-                                level_id, level_str, grid_size_x = await get_level(max(1, player_info.level))
+                                level_id, level_str, grid_size_x, brightness = await get_level(max(1, player_info.level))
                                 player: PlayerInfo
-                                brightness = 1.0 - (level_id - 1) / levels_to_win
                                 await ws.send_str(
                                     create_level_message(level_id,grid_size_x,brightness,level_str)
                                 )
                                 continue
                             elif all_players_ready and player_info is None:
                                 await ws.send_str(
-                                    create_message_message(
+                                    create_message(
                                         "Game already\nin progress",
                                         bg_style="#400", fg_style="#fcc"
                                     )
@@ -192,7 +217,7 @@ async def websocket_handler(request: Request):
                             if player_info is None:
                                 player_info = PlayerInfo(player_name, ws)
                                 player_info.is_ready = all_players_ready
-                                remote_player_infos[id(request)] = player_info
+                                remote_player_infos[request.remote] = player_info
 
                             elif player_info.socket.closed:
                                 player_info.socket = ws
@@ -211,10 +236,9 @@ async def websocket_handler(request: Request):
                         all_players_ready = all(p.is_ready for p in remote_player_infos.values())
 
                         if not was_all_players_ready and all_players_ready:
-                            level_id, level_str, grid_size_x = await get_level(1)
+                            level_id, level_str, grid_size_x, brightness = await get_level(1)
                             player: PlayerInfo
 
-                            brightness = 1.0 - (level_id - 1) / levels_to_win
                             await send_to_all_players(
                                 create_level_message(level_id, grid_size_x, brightness, level_str)
                             )
@@ -230,7 +254,7 @@ async def websocket_handler(request: Request):
                         except TypeError:
                             continue
 
-                        level_id, level_str, grid_size_x = await get_level(level_id)
+                        level_id, level_str, grid_size_x, brightness = await get_level(level_id)
 
                         player_info.level = level_id
 
@@ -243,6 +267,19 @@ async def websocket_handler(request: Request):
                             match players_done:
                                 case 0:
                                     player_info.result_message = ResultMessage("You are #1!", "#631", "#fc4")
+
+                                    def message(p):
+                                        if p == player_info:
+                                            return None
+                                        else:
+                                            return create_overlay_message(
+                                                f"{player_info.name} is already done\nHurry up!",
+                                                display_time=2.0, animation="fly-in"
+                                            )
+
+                                    await send_to_all_players(message)
+
+                                    asyncio.ensure_future(count_down(5.0, 30))
                                 case 1:
                                     player_info.result_message = ResultMessage("You are #2", "#334", "#eef4ff")
                                 case 2:
@@ -264,20 +301,35 @@ async def websocket_handler(request: Request):
                             update_leaderboard_results()
 
                             if players_done_count() == len(remote_player_infos):
-                                remote_player_infos.clear()
-                                generated_levels.clear()
+                                await end_game()
 
                             continue
 
-                        brightness = 1.0-(level_id-1)/levels_to_win
                         await ws.send_str(
                             create_level_message(level_id, grid_size_x, brightness, level_str)
                         )
 
-                    elif command == "AnnounceProgress" and player_info is not None and re.match("^\\d+/\\d+$", data):
-                        player_info.level_progress = eval(data)  # should be fine
+                    elif command == "AnnounceProgress" and player_info is not None:
+                        match = re.match("^(\\d+);(\\d+);(.*)$", data)
+                        if match:
+                            grid_size_x = int(match[1])
+                            grid_size_y = int(match[2])
+                            compressed_level_bytes = np.frombuffer(base64.b64decode(match[3]), dtype='uint8')
 
-                        update_leaderboard_results()
+                            level_bytes = np.zeros(shape=(len(compressed_level_bytes), 4), dtype='uint8')
+
+                            level_bytes[:, 0] |= compressed_level_bytes & 0b11
+                            level_bytes[:, 1] |= (compressed_level_bytes >> 2) & 0b11
+                            level_bytes[:, 2] |= (compressed_level_bytes >> 4) & 0b11
+                            level_bytes[:, 3] |= (compressed_level_bytes >> 6)
+
+                            empty_count = np.count_nonzero(level_bytes == 0)
+                            filled_count = np.count_nonzero(level_bytes == 2)
+
+                            player_info.level_progress = filled_count / (empty_count+filled_count)
+                            player_info.last_progress_message = data
+
+                            update_leaderboard_results()
 
         elif msg.type == aiohttp.WSMsgType.ERROR:
             print('ws connection closed with exception %s' % ws.exception())
@@ -330,12 +382,56 @@ def create_runner():
     return web.AppRunner(app)
 
 
-async def start_server(host="192.168.137.1", port=8000):
+async def start_server(host="0.0.0.0", port=8000):
     runner = create_runner()
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
     print("server started on", host, f"port={port}")
+
+
+async def count_down(delay, number=30):
+    await asyncio.sleep(delay)
+    while number > 10:
+        if players_done_count() == len(remote_player_infos):
+            return
+
+        def message(p: PlayerInfo):
+            if p.result_message is None:
+                return create_overlay_message(f"{number} seconds left!", display_time=2.0,
+                                              animation="fly-in")
+
+        await send_to_all_players(message)
+
+        await asyncio.sleep(10)
+        number -= 10
+
+    while number > 0:
+        if players_done_count() == len(remote_player_infos):
+            return
+
+        def message(p: PlayerInfo):
+            if p.result_message is None:
+                if number <= 3:
+                    return create_overlay_message(f"  {number}  ", style="#f88")
+                else:
+                    return create_overlay_message(f"   {number}   ")
+
+        await send_to_all_players(message)
+
+        await asyncio.sleep(1)
+        number -= 1
+
+    if players_done_count() == len(remote_player_infos):
+        return
+
+    def message(p: PlayerInfo):
+        if p.result_message is None:
+            return create_message("Game over", bg_style="#300", fg_style="#f00")
+
+    await send_to_all_players(message)
+
+    await end_game()
 
 
 async def publish_results():
@@ -353,7 +449,7 @@ async def publish_results():
 
 
 if __name__ == "__main__":
-    asyncio.ensure_future(start_server())
+    asyncio.ensure_future(start_server(sys.argv[1], int(sys.argv[2])))
     asyncio.ensure_future(publish_results())
 
     loop = asyncio.get_event_loop()
