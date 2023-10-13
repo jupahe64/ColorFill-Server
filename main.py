@@ -2,10 +2,9 @@ import base64
 import json
 import mimetypes
 import os.path
-import random
 import re
 import sys
-from typing import Optional, Callable, NamedTuple
+from typing import Optional, Callable, NamedTuple, Tuple, Iterable
 
 import aiohttp
 from aiohttp import web, WSMessage
@@ -107,8 +106,13 @@ async def send_to_all_players(message: str | Callable[[PlayerInfo], Optional[str
                 await player.socket.send_str(_message)
 
 
-def create_level_message(level_id, grid_size_x, brightness, level_str):
-    return f"level:{level_id};{grid_size_x};{brightness};{level_str}"
+def create_level_message(level_id, level_name: str, grid_size_x: int, brightness: float, level_str: str):
+    return f"level:{level_id};{level_name};{grid_size_x};{brightness};{level_str}"
+
+
+def create_lobby_message(players: Iterable[Tuple[str, bool]]):
+    players_str = "\n".join(name+("+" if ready else "-") for name, ready in players)
+    return f"lobby:{players_str}"
 
 
 def create_message(message, bg_style="#000", fg_style="#fff"):
@@ -187,6 +191,11 @@ async def websocket_handler(request: Request):
                 if match:
                     command, data = match.groups()
 
+                    def lobby_message(self_p: PlayerInfo):
+                        return create_lobby_message(
+                            (p.name, p.is_ready) for p in remote_player_infos.values() if p is not self_p
+                        )
+
                     if command == "RegisterPlayer":
                         if player_info is not None and player_info.result_message is not None:
                             await ws.send_str(player_info.result_message.to_message(
@@ -194,7 +203,7 @@ async def websocket_handler(request: Request):
                             ))
                             continue
 
-                        match = re.match("^(.*)\\[(.*)]$", data)
+                        match = re.match(r"^(.*){(.*)}$", data)
                         if match:
                             player_name, extra_infos = match.groups()
 
@@ -202,7 +211,7 @@ async def websocket_handler(request: Request):
                                 level_id, level_str, grid_size_x, brightness = await get_level(max(1, player_info.level))
                                 player: PlayerInfo
                                 await ws.send_str(
-                                    create_level_message(level_id,grid_size_x,brightness,level_str)
+                                    create_level_message(level_id, f"Level {level_id}",grid_size_x,brightness,level_str)
                                 )
                                 continue
                             elif all_players_ready and player_info is None:
@@ -218,9 +227,10 @@ async def websocket_handler(request: Request):
                                 player_info = PlayerInfo(player_name, ws)
                                 player_info.is_ready = all_players_ready
                                 remote_player_infos[request.remote] = player_info
-
                             elif player_info.socket.closed:
                                 player_info.socket = ws
+                            else:
+                                player_info.name = player_name
 
                             for pair in extra_infos.split(";"):
                                 key, value = pair.split("=", 1)
@@ -228,7 +238,7 @@ async def websocket_handler(request: Request):
                                 if key == "levelSizeRatio":
                                     player_info.level_size_ratio = float(value)
 
-                            await send_to_all_players(f"lobby:{ready_players_count()}/{len(remote_player_infos)}")
+                            await send_to_all_players(lobby_message)
 
                     elif command == "AnnounceReady":
                         was_all_players_ready = all_players_ready
@@ -240,23 +250,17 @@ async def websocket_handler(request: Request):
                             player: PlayerInfo
 
                             await send_to_all_players(
-                                create_level_message(level_id, grid_size_x, brightness, level_str)
+                                create_level_message(level_id, f"Level {level_id}", grid_size_x, brightness, level_str)
                             )
 
                             for player in remote_player_infos.values():
                                 player.level = level_id
                         else:
-                            await send_to_all_players(f"lobby:{ready_players_count()}/{len(remote_player_infos)}")
+                            await send_to_all_players(lobby_message)
 
-                    elif command == "RequestLevel" and player_info is not None and re.match("^\\d+$", data):
-                        try:
-                            level_id = int(data)
-                        except TypeError:
-                            continue
-
-                        level_id, level_str, grid_size_x, brightness = await get_level(level_id)
-
-                        player_info.level = level_id
+                    elif command == "AnnounceDone" and player_info is not None:
+                        player_info.level += 1
+                        level_id, level_str, grid_size_x, brightness = await get_level(player_info.level)
 
                         if level_id == levels_to_win+1:
                             player_info.level -= 1
@@ -306,7 +310,7 @@ async def websocket_handler(request: Request):
                             continue
 
                         await ws.send_str(
-                            create_level_message(level_id, grid_size_x, brightness, level_str)
+                            create_level_message(level_id, f"Level {level_id}", grid_size_x, brightness, level_str)
                         )
 
                     elif command == "AnnounceProgress" and player_info is not None:
@@ -355,11 +359,11 @@ async def file_handler(path):
     print(f"loading file {path}")
     if not os.path.exists(path):
         print("FAILED")
-        leaderboard_page_res_path = "Live-Leaderboard/public/"+path
-        if os.path.exists(leaderboard_page_res_path):
-            return await file_handler(leaderboard_page_res_path)
-        else:
-            return web.Response(status=404)
+        # leaderboard_page_res_path = "Live-Leaderboard/public/"+path
+        # if os.path.exists(leaderboard_page_res_path):
+        #     return await file_handler(leaderboard_page_res_path)
+        # else:
+        return web.Response(status=404)
 
     with open(path, 'rb') as file:
         return web.Response(body=file.read(), content_type=mimetypes.guess_type(path)[0])
@@ -367,13 +371,19 @@ async def file_handler(path):
 
 async def any_file_handler(request: Request):
     path = request.path[1:]
+    referring_page = request.cookies.get("referringPage")
+
+    if referring_page == "Client":
+        path = "ColorFill-Client/public/" + path
+    elif referring_page == "Leaderboard":
+        path = "Live-Leaderboard/public/" + path
     return await file_handler(path)
 
 
 def create_runner():
     app = web.Application()
     app.add_routes([
-        web.get('/', lambda x: file_handler("index.html")),
+        web.get('/', lambda x: file_handler("ColorFill-Client/public/index.html")),
         web.get('/leaderboard', lambda x: file_handler("Live-Leaderboard/public/index.html")),
         web.get('/ws', websocket_handler),
         web.get('/leaderboard/ws', websocket_handler_leaderboard),
