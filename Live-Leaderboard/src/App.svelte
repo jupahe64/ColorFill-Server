@@ -1,6 +1,38 @@
 <script lang="ts">
 	import { Base64Binary } from "./base64-binary";
 
+	type KeyExtractor<TItem, TValue> = (item: TItem) => TValue;
+
+	function maxBy<TItem, TValue>(array: Array<TItem>, f: KeyExtractor<TItem, TValue>): TItem | null {
+		let best: TItem | null = null;
+		let bestValue: TValue  = null;
+
+		for (const item of array) {
+			let value: TValue = f(item);
+			if (best == null || value > bestValue) {
+				best = item;
+				bestValue = value;
+			}
+		}
+
+		return best;
+	}
+
+	function minBy<TItem, TValue>(array: Array<TItem>, f: KeyExtractor<TItem, TValue>): TItem | null {
+		let best: TItem | null = null;
+		let bestValue: TValue  = null;
+
+		for (const item of array) {
+			let value: TValue = f(item);
+			if (best == null || value < bestValue) {
+				best = item;
+				bestValue = value;
+			}
+		}
+
+		return best;
+	}
+
 	export let name: string;
 
 	class UserInfo {
@@ -8,7 +40,7 @@
 			public name: string,
 			public levelID: number | string,
 			public progress: number,
-			public solidBlockSvgPath: string,
+			public emptyBlockSvgPath: string,
 			public filledBlockSvgPath: string,
 			public levelSvgWidth: number,
 			public levelSvgHeight: number
@@ -31,7 +63,7 @@
 	class LevelProgressCacheEntry {
 		constructor(
 			public progress: number,
-			public solidBlockSvgPath: string, 
+			public emptyBlockSvgPath: string, 
 			public filledBlockSvgPath: string,
 			public levelSvgWidth: number,
 			public levelSvgHeight: number
@@ -70,7 +102,7 @@
 					let levelString = values[2];
 					let levelBytes = Base64Binary.decode(levelString);
 
-					let solidBlockSvgPath = "";
+					let emptyBlockSvgPath = "";
 					let filledBlockSvgPath = "";
 
 					let emptyCount = 0;
@@ -83,12 +115,13 @@
 							const x = (i*4+j) % gridSizeX;
 							const y = Math.trunc((i*4+j) / gridSizeX);
 
+							if (y >= gridSizeY)
+								continue;
+
 							switch (block) {
 								case 0:
+									emptyBlockSvgPath += `M${x} ${y}h1v1h-1`;
 									emptyCount++;
-									break;
-								case 1:
-									solidBlockSvgPath += `M${x} ${y}h1v1h-1`;
 									break;
 								case 2:
 									filledBlockSvgPath += `M${x} ${y}h1v1h-1`;
@@ -98,7 +131,7 @@
 						}
 					}
 
-					cacheEntry = new LevelProgressCacheEntry(levelProgress, solidBlockSvgPath, filledBlockSvgPath,
+					cacheEntry = new LevelProgressCacheEntry(levelProgress, emptyBlockSvgPath, filledBlockSvgPath,
 															 gridSizeX, gridSizeY);
 
 					progressMessageCache[progressMessage] = cacheEntry;
@@ -108,7 +141,7 @@
 					name,
 					levelID,
 					cacheEntry.progress,
-					cacheEntry.solidBlockSvgPath,
+					cacheEntry.emptyBlockSvgPath,
 					cacheEntry.filledBlockSvgPath,
 					cacheEntry.levelSvgWidth,
 					cacheEntry.levelSvgHeight
@@ -136,6 +169,21 @@
 <main>
 	<h1>{name}</h1>
 
+	<div style="display: flex; flex-direction: row; align-items: center; justify-content: center;">
+		{#each users as user}
+			{@const minUserLevelHeight = minBy(users, user => user.levelSvgHeight).levelSvgHeight}
+			<div>
+				<svg style="marging: auto;" width="8em" height="8em" viewBox="0 3 {user.levelSvgWidth} {minUserLevelHeight}">
+					<path fill="#444" d="{user.emptyBlockSvgPath}"/>
+					<path fill="#fff" d="{user.filledBlockSvgPath}"/>
+				</svg>
+				<p style="align: center;">
+					{user.name}
+				</p>
+			</div>
+		{/each}
+	</div>
+
 	<table>
 		{#each users as user, index}
 			{@const percent = Math.round(user.progress*100)}
@@ -145,12 +193,6 @@
 			<td style="text-align: right; padding-right: 1rem; width: 2.5em" class="rounded-left"><b>#{index+1}</b></td>
 			<td style="padding-left: 1rem;">{user.name}</td>
 			<td style="text-align: center; width: 1.5em">{user.levelID}</td>
-			<td style="text-align: center; width: 1.5em">
-				<svg width="100%" viewBox="0 0 {user.levelSvgWidth} {user.levelSvgHeight}">
-					<path fill="#fff" d="{user.filledBlockSvgPath}"/>
-					<rect stroke-width="0.5" stroke="#fff" fill="transparent" x="0" y="0" width="{user.levelSvgWidth}" height="{user.levelSvgHeight}" />
-				</svg>
-			</td>
 			<td width="50%" class="rounded-right">
 				<div class="bar rounded-right" style="width: calc({percent}% - 1em); background: color-mix(in srgb, #c30, #0c0 {percent}%)">
 					{percent}%
