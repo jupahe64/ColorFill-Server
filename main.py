@@ -170,170 +170,171 @@ async def websocket_handler(request: Request):
         if msg.type == aiohttp.WSMsgType.TEXT:
             if msg.data == 'close':
                 await ws.close()
+                continue
+
+            player_info = remote_player_infos.get(request.remote, None)
+            if player_info is not None:
+                origin = f"{player_info.name}({request.remote})"
             else:
-                player_info = remote_player_infos.get(request.remote, None)
-                if player_info is not None:
-                    origin = f"{player_info.name}({request.remote})"
-                else:
-                    origin = request.remote
+                origin = request.remote
 
-                print("received", msg.data, "from", origin)
+            print("received", msg.data, "from", origin)
 
-                player_info: PlayerInfo = remote_player_infos.get(request.remote, None)
+            player_info: PlayerInfo = remote_player_infos.get(request.remote, None)
 
-                p: PlayerInfo
-                all_players_ready = ready_players_count() == len(remote_player_infos)
+            p: PlayerInfo
+            all_players_ready = ready_players_count() == len(remote_player_infos)
 
-                if ready_players_count() == 0:
-                    all_players_ready = False
+            if ready_players_count() == 0:
+                all_players_ready = False
 
-                match = re.match("^([a-zA-Z0-9_]*):(.*)$", msg.data)
-                if match:
-                    command, data = match.groups()
+            match = re.match("^([a-zA-Z0-9_]*):(.*)$", msg.data)
+            if match:
+                command, data = match.groups()
 
-                    def lobby_message(self_p: PlayerInfo):
-                        return create_lobby_message(
-                            (p.name, p.is_ready) for p in remote_player_infos.values() if p is not self_p
-                        )
+                def lobby_message(self_p: PlayerInfo):
+                    return create_lobby_message(
+                        (p.name, p.is_ready) for p in remote_player_infos.values() if p is not self_p
+                    )
 
-                    if command == "RegisterPlayer":
-                        if player_info is not None and player_info.result_message is not None:
-                            await ws.send_str(player_info.result_message.to_message(
-                                len(remote_player_infos) - players_done_count()
-                            ))
-                            continue
+                if command == "RegisterPlayer":
+                    if player_info is not None and player_info.result_message is not None:
+                        await ws.send_str(player_info.result_message.to_message(
+                            len(remote_player_infos) - players_done_count()
+                        ))
+                        continue
 
-                        match = re.match(r"^(.*){(.*)}$", data)
-                        if match:
-                            player_name, extra_infos = match.groups()
+                    match = re.match(r"^(.*){(.*)}$", data)
+                    if match:
+                        player_name, extra_infos = match.groups()
 
-                            if all_players_ready and player_info is not None:
-                                level_id, level_str, grid_size_x, brightness = await get_level(max(1, player_info.level))
-                                player: PlayerInfo
-                                await ws.send_str(
-                                    create_level_message(level_id, f"Level {level_id}",grid_size_x,brightness,level_str)
-                                )
-                                continue
-                            elif all_players_ready and player_info is None:
-                                await ws.send_str(
-                                    create_message(
-                                        "Game already\nin progress",
-                                        bg_style="#400", fg_style="#fcc"
-                                    )
-                                )
-                                continue
-
-                            if player_info is None:
-                                player_info = PlayerInfo(player_name, ws)
-                                player_info.is_ready = all_players_ready
-                                remote_player_infos[request.remote] = player_info
-                            elif player_info.socket.closed:
-                                player_info.socket = ws
-                            else:
-                                player_info.name = player_name
-
-                            for pair in extra_infos.split(";"):
-                                key, value = pair.split("=", 1)
-
-                                if key == "levelSizeRatio":
-                                    player_info.level_size_ratio = float(value)
-
-                            await send_to_all_players(lobby_message)
-
-                    elif command == "AnnounceReady":
-                        was_all_players_ready = all_players_ready
-                        player_info.is_ready = True
-                        all_players_ready = all(p.is_ready for p in remote_player_infos.values())
-
-                        if not was_all_players_ready and all_players_ready:
-                            level_id, level_str, grid_size_x, brightness = await get_level(1)
+                        if all_players_ready and player_info is not None:
+                            level_id, level_str, grid_size_x, brightness = await get_level(max(1, player_info.level))
                             player: PlayerInfo
-
-                            await send_to_all_players(
-                                create_level_message(level_id, f"Level {level_id}", grid_size_x, brightness, level_str)
+                            await ws.send_str(
+                                create_level_message(level_id, f"Level {level_id}",grid_size_x,brightness,level_str)
                             )
-
-                            for player in remote_player_infos.values():
-                                player.level = level_id
-                        else:
-                            await send_to_all_players(lobby_message)
-
-                    elif command == "AnnounceDone" and player_info is not None:
-                        player_info.level += 1
-                        level_id, level_str, grid_size_x, brightness = await get_level(player_info.level)
-
-                        if level_id == levels_to_win+1:
-                            player_info.level -= 1
-                            player_info.level_progress = 1.0
-
-                            players_done = players_done_count()
-
-                            match players_done:
-                                case 0:
-                                    player_info.result_message = ResultMessage("You are #1!", "#631", "#fc4")
-
-                                    def message(p):
-                                        if p == player_info:
-                                            return None
-                                        else:
-                                            return create_overlay_message(
-                                                f"{player_info.name} is already done\nHurry up!",
-                                                display_time=2.0, animation="fly-in"
-                                            )
-
-                                    await send_to_all_players(message)
-
-                                    asyncio.ensure_future(count_down(5.0, 30))
-                                case 1:
-                                    player_info.result_message = ResultMessage("You are #2", "#334", "#eef4ff")
-                                case 2:
-                                    player_info.result_message = ResultMessage("You are #3", "#521", "#fa7")
-                                case _:
-                                    player_info.result_message = ResultMessage(f"You are #{players_done + 1}",
-                                                                               "#034", "#cfd")
-
-                            players_left = len(remote_player_infos) - players_done_count()
-
-                            def message(p: PlayerInfo):
-                                if p.result_message is not None:
-                                    return p.result_message.to_message(players_left)
-                                else:
-                                    return None
-
-                            await send_to_all_players(message)
-
-                            update_leaderboard_results()
-
-                            if players_done_count() == len(remote_player_infos):
-                                await end_game()
-
+                            continue
+                        elif all_players_ready and player_info is None:
+                            await ws.send_str(
+                                create_message(
+                                    "Game already\nin progress",
+                                    bg_style="#400", fg_style="#fcc"
+                                )
+                            )
                             continue
 
-                        await ws.send_str(
+                        if player_info is None:
+                            player_info = PlayerInfo(player_name, ws)
+                            player_info.is_ready = all_players_ready
+                            remote_player_infos[request.remote] = player_info
+                        elif player_info.socket.closed:
+                            player_info.socket = ws
+                        else:
+                            player_info.name = player_name
+
+                        for pair in extra_infos.split(";"):
+                            key, value = pair.split("=", 1)
+
+                            if key == "levelSizeRatio":
+                                player_info.level_size_ratio = float(value)
+
+                        await send_to_all_players(lobby_message)
+
+                elif command == "AnnounceReady":
+                    was_all_players_ready = all_players_ready
+                    player_info.is_ready = True
+                    all_players_ready = all(p.is_ready for p in remote_player_infos.values())
+
+                    if not was_all_players_ready and all_players_ready:
+                        level_id, level_str, grid_size_x, brightness = await get_level(1)
+                        player: PlayerInfo
+
+                        await send_to_all_players(
                             create_level_message(level_id, f"Level {level_id}", grid_size_x, brightness, level_str)
                         )
 
-                    elif command == "AnnounceProgress" and player_info is not None:
-                        match = re.match("^(\\d+);(\\d+);(.*)$", data)
-                        if match:
-                            grid_size_x = int(match[1])
-                            grid_size_y = int(match[2])
-                            compressed_level_bytes = np.frombuffer(base64.b64decode(match[3]), dtype='uint8')
+                        for player in remote_player_infos.values():
+                            player.level = level_id
+                    else:
+                        await send_to_all_players(lobby_message)
 
-                            level_bytes = np.zeros(shape=(len(compressed_level_bytes), 4), dtype='uint8')
+                elif command == "AnnounceDone" and player_info is not None:
+                    player_info.level += 1
+                    level_id, level_str, grid_size_x, brightness = await get_level(player_info.level)
 
-                            level_bytes[:, 0] |= compressed_level_bytes & 0b11
-                            level_bytes[:, 1] |= (compressed_level_bytes >> 2) & 0b11
-                            level_bytes[:, 2] |= (compressed_level_bytes >> 4) & 0b11
-                            level_bytes[:, 3] |= (compressed_level_bytes >> 6)
+                    if level_id == levels_to_win+1:
+                        player_info.level -= 1
+                        player_info.level_progress = 1.0
 
-                            empty_count = np.count_nonzero(level_bytes == 0)
-                            filled_count = np.count_nonzero(level_bytes == 2)
+                        players_done = players_done_count()
 
-                            player_info.level_progress = filled_count / (empty_count+filled_count)
-                            player_info.last_progress_message = data
+                        match players_done:
+                            case 0:
+                                player_info.result_message = ResultMessage("You are #1!", "#631", "#fc4")
 
-                            update_leaderboard_results()
+                                def message(p):
+                                    if p == player_info:
+                                        return None
+                                    else:
+                                        return create_overlay_message(
+                                            f"{player_info.name} is already done\nHurry up!",
+                                            display_time=2.0, animation="fly-in"
+                                        )
+
+                                await send_to_all_players(message)
+
+                                asyncio.ensure_future(count_down(5.0, 30))
+                            case 1:
+                                player_info.result_message = ResultMessage("You are #2", "#334", "#eef4ff")
+                            case 2:
+                                player_info.result_message = ResultMessage("You are #3", "#521", "#fa7")
+                            case _:
+                                player_info.result_message = ResultMessage(f"You are #{players_done + 1}",
+                                                                           "#034", "#cfd")
+
+                        players_left = len(remote_player_infos) - players_done_count()
+
+                        def message(p: PlayerInfo):
+                            if p.result_message is not None:
+                                return p.result_message.to_message(players_left)
+                            else:
+                                return None
+
+                        await send_to_all_players(message)
+
+                        update_leaderboard_results()
+
+                        if players_done_count() == len(remote_player_infos):
+                            await end_game()
+
+                        continue
+
+                    await ws.send_str(
+                        create_level_message(level_id, f"Level {level_id}", grid_size_x, brightness, level_str)
+                    )
+
+                elif command == "AnnounceProgress" and player_info is not None:
+                    match = re.match("^(\\d+);(\\d+);(.*)$", data)
+                    if match:
+                        grid_size_x = int(match[1])
+                        grid_size_y = int(match[2])
+                        compressed_level_bytes = np.frombuffer(base64.b64decode(match[3]), dtype='uint8')
+
+                        level_bytes = np.zeros(shape=(len(compressed_level_bytes), 4), dtype='uint8')
+
+                        level_bytes[:, 0] |= compressed_level_bytes & 0b11
+                        level_bytes[:, 1] |= (compressed_level_bytes >> 2) & 0b11
+                        level_bytes[:, 2] |= (compressed_level_bytes >> 4) & 0b11
+                        level_bytes[:, 3] |= (compressed_level_bytes >> 6)
+
+                        empty_count = np.count_nonzero(level_bytes == 0)
+                        filled_count = np.count_nonzero(level_bytes == 2)
+
+                        player_info.level_progress = filled_count / (empty_count+filled_count)
+                        player_info.last_progress_message = data
+
+                        update_leaderboard_results()
 
         elif msg.type == aiohttp.WSMsgType.ERROR:
             print('ws connection closed with exception %s' % ws.exception())
